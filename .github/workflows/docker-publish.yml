@@ -1,0 +1,216 @@
+# Shared, reusable workflow: build once per architecture, publish ONE multi-arch image to GHCR,
+# tag it with the commit, and optionally trigger a Coolify deploy.
+#
+# Call it from any repo in the org (see workflow-templates/docker-publish.yml):
+#   jobs:
+#     image:
+#       uses: Cascadian-Technology-CAS-Tech/.github/.github/workflows/docker-publish.yml@main
+#       with: { platforms: '["linux/amd64","linux/arm64"]' }
+#       secrets: inherit
+#
+# The caller must grant:  permissions: { contents: read, packages: write }
+name: Docker build and publish (GHCR)
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Image path under ghcr.io, e.g. my-org/my-app. Empty means the calling repository, lowercased."
+        type: string
+        default: ""
+      context:
+        type: string
+        default: "."
+      dockerfile:
+        type: string
+        default: "./Dockerfile"
+      platforms:
+        description: 'JSON list of platforms. Use ["linux/amd64"] for apps that are not arm64-ready yet.'
+        type: string
+        default: '["linux/amd64","linux/arm64"]'
+      build-args:
+        description: "Newline-separated KEY=value build arguments. Not secret: they end up in image history."
+        type: string
+        default: ""
+      push:
+        description: "Set false to build only (for pull requests)."
+        type: boolean
+        default: true
+      deploy-method:
+        description: "HTTP method for the Coolify deploy webhook (GET or POST)."
+        type: string
+        default: "GET"
+    secrets:
+      build-secrets:
+        description: "Newline-separated KEY=value BuildKit secrets, read in the Dockerfile with RUN --mount=type=secret."
+        required: false
+      coolify-webhook:
+        description: "Coolify deploy webhook URL. When empty, no deploy is triggered."
+        required: false
+      coolify-token:
+        description: "Coolify API token with the deploy ability."
+        required: false
+    outputs:
+      image:
+        description: "Image name without tag"
+        value: ${{ jobs.prepare.outputs.image }}
+      tag:
+        description: "Immutable tag for this commit (sha-<7 chars>)"
+        value: ${{ jobs.prepare.outputs.sha_tag }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.plan.outputs.image }}
+      sha_tag: ${{ steps.plan.outputs.sha_tag }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Work out image name and build matrix
+        id: plan
+        env:
+          IMAGE_INPUT: ${{ inputs.image-name }}
+          PLATFORMS: ${{ inputs.platforms }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          name="${IMAGE_INPUT:-$REPO}"
+          image="ghcr.io/$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+          # one native runner per architecture: no emulation, much faster than QEMU
+          matrix=$(echo "$PLATFORMS" | jq -c '{include: map({
+              platform: .,
+              pair: (. | gsub("/"; "-")),
+              runner: (if . == "linux/arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)
+            })}')
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
+          secrets: ${{ secrets.build-secrets }}
+          provenance: false
+          cache-from: type=gha,scope=${{ github.repository }}-${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=${{ github.repository }}-${{ matrix.pair }},ignore-error=true
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=${{ inputs.push }}
+
+      - name: Export digest
+        if: ${{ inputs.push }}
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: ${{ inputs.push }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch manifest
+    if: ${{ inputs.push }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Create and push the manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          set -euo pipefail
+          tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create $tags $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAG: ${{ needs.prepare.outputs.sha_tag }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+          {
+            echo "### Published"
+            echo '```'
+            docker buildx imagetools inspect "${IMAGE}:${TAG}" | grep -E "^(Name|MediaType|Digest)|Platform"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Trigger Coolify deploy
+    if: ${{ inputs.push }}
+    needs: [prepare, merge]
+    runs-on: ubuntu-latest
+    env:
+      HOOK: ${{ secrets.coolify-webhook }}
+      TOKEN: ${{ secrets.coolify-token }}
+      METHOD: ${{ inputs.deploy-method }}
+    steps:
+      - name: Call the deploy webhook (skipped when no webhook is set)
+        run: |
+          if [ -z "${HOOK:-}" ]; then echo "No coolify-webhook secret set; not deploying."; exit 0; fi
+          curl -fsS --retry 3 --retry-delay 5 -X "$METHOD" "$HOOK" -H "Authorization: Bearer ${TOKEN:-}"
+          echo "Deploy triggered for ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.sha_tag }}"

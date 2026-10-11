@@ -1,0 +1,28 @@
+# Starter workflow: publish this repository's image to GHCR (amd64 + arm64) and deploy through Coolify.
+name: Build and publish image
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: Cascadian-Technology-CAS-Tech/.github/.github/workflows/docker-publish.yml@main
+    with:
+      # Pull requests only build, they never push or deploy
+      push: ${{ github.event_name != 'pull_request' }}
+      # Use ["linux/amd64"] until the app has been tested on arm64
+      platforms: '["linux/amd64","linux/arm64"]'
+    secrets:
+      # Optional: one KEY=value per line, read in the Dockerfile with RUN --mount=type=secret,id=KEY
+      build-secrets: ${{ secrets.BUILD_SECRETS }}
+      # Optional: set both to deploy automatically after a push
+      coolify-webhook: ${{ github.ref_name == 'main' && secrets.COOLIFY_WEBHOOK || secrets.COOLIFY_WEBHOOK_STAGING }}
+      coolify-token: ${{ secrets.COOLIFY_TOKEN }}
