@@ -1,0 +1,7 @@
+{
+  "name": "Build and publish image (GHCR, amd64 + arm64)",
+  "description": "Builds one multi-architecture image, publishes it to GitHub Container Registry tagged with the commit, and can trigger a Coolify deploy.",
+  "iconName": "octicon package",
+  "categories": ["Docker", "Deployment"],
+  "filePatterns": ["Dockerfile$"]
+}
